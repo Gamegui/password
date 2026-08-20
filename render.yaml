@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: safekey
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8787
+    disk:
+      name: safekey-data
+      mountPath: /app/data
+      sizeGB: 1
