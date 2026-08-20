@@ -1,5 +1,9 @@
-// Провайдер «Google Drive»: OAuth 2.0 authorization code + PKCE (без client secret)
-// и Drive API v3 в скрытой папке приложения (appDataFolder → safekey.vault).
+// Провайдер «Google Drive»: OAuth 2.0 authorization code + PKCE и Drive API v3
+// в скрытой папке приложения (appDataFolder → safekey.vault).
+// Google для OAuth-клиента «Web application» при обмене code → token требует
+// ещё client_secret (иначе 400 invalid_client), поэтому секрет тоже передаётся
+// в exchangeCode. Секрет хранится ТОЛЬКО в localStorage этого браузера и
+// никогда не попадает в код/репозиторий — в открытом коде его увидеть нельзя.
 // Токены Google короткоживущие (~1 час) — обновляются тихо в скрытом iframe
 // (prompt=none), без повторного ввода пароля, пока активна сессия Google.
 
@@ -14,6 +18,7 @@ const UPLOAD_ROOT = 'https://www.googleapis.com/upload/drive/v3'
 const SCOPE = 'openid email https://www.googleapis.com/auth/drive.appdata'
 
 const CLIENT_ID_KEY = 'safekey.google.clientId'
+const CLIENT_SECRET_KEY = 'safekey.google.clientSecret'
 const TOKEN_KEY = 'safekey.google.token.v1'
 const STATE_KEY = 'safekey.oauth.state.google'
 const VERIFIER_KEY = 'safekey.oauth.verifier'
@@ -35,6 +40,18 @@ export function setClientId(id: string) {
   else localStorage.removeItem(CLIENT_ID_KEY)
 }
 
+/** Секрет Google хранится только в localStorage браузера (не в коде/репозитории). */
+export function getClientSecret(): string {
+  const override = localStorage.getItem(CLIENT_SECRET_KEY)
+  return (override || '').trim()
+}
+
+export function setClientSecret(secret: string) {
+  const value = secret.trim()
+  if (value) localStorage.setItem(CLIENT_SECRET_KEY, value)
+  else localStorage.removeItem(CLIENT_SECRET_KEY)
+}
+
 const redirectUri = () => location.origin + location.pathname
 const getStoredToken = (): StoredToken | null => {
   try { return JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null') } catch { return null }
@@ -53,8 +70,10 @@ function authUrl(params: Record<string, string>) {
   return url.toString()
 }
 
-/** Обмен code → access_token (публичный клиент PKCE, секрет не нужен). */
+/** Обмен code → access_token. Google для «Web application» требует client_secret (даже с PKCE). */
 async function exchangeCode(code: string, verifier: string): Promise<StoredToken> {
+  const clientSecret = getClientSecret()
+  if (!clientSecret) throw new ProviderError('client_secret_missing', 0)
   let response: Response
   try {
     response = await fetch(TOKEN_URL, {
@@ -62,6 +81,7 @@ async function exchangeCode(code: string, verifier: string): Promise<StoredToken
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         client_id: getClientId(),
+        client_secret: clientSecret,
         code,
         code_verifier: verifier,
         grant_type: 'authorization_code',
@@ -162,11 +182,12 @@ export const googleProvider: SyncProvider = {
   id: 'google',
   title: 'Google Drive',
 
-  isConfigured: () => Boolean(getClientId()),
+  isConfigured: () => Boolean(getClientId() && getClientSecret()),
 
   login(intent: OAuthIntent) {
     const clientId = getClientId()
     if (!clientId) throw new ProviderError('client_id_missing', 0)
+    if (!getClientSecret()) throw new ProviderError('client_secret_missing', 0)
     const state = crypto.randomUUID().replace(/-/g, '')
     sessionStorage.setItem(STATE_KEY, state)
     saveIntent(intent)
@@ -203,8 +224,8 @@ export const googleProvider: SyncProvider = {
     if (!code || !verifier || (expected && gotState !== expected)) return { error: 'state_mismatch' }
     try {
       saveStoredToken(await exchangeCode(code, verifier))
-    } catch {
-      return { error: 'token_exchange_failed' }
+    } catch (error) {
+      return { error: error instanceof ProviderError && error.message === 'client_secret_missing' ? 'client_secret_missing' : 'token_exchange_failed' }
     }
     return { intent: intent || 'sync' }
   },

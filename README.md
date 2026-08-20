@@ -89,9 +89,9 @@
 4. **Credentials → Create credentials → OAuth client ID** → тип **Web application**:
    - **Authorized JavaScript origins**: `https://<user>.github.io` (только источник, без пути) и `http://localhost:5173`;
    - **Authorized redirect URIs**: `https://<user>.github.io/password/` и `http://localhost:5173/`.
-5. Скопируйте **ClientID** (`...apps.googleusercontent.com`) в `public/app-config.js` → `GOOGLE_CLIENT_ID` или введите в приложении.
+5. Скопируйте **ClientID** (`...apps.googleusercontent.com`) и **Client Secret** (на той же странице клиента, рядом с ClientID). Оба значения введите в приложении в карточке Google Drive («Синхронизация» → «Подключить облако» или экран «Облачный сейф»). ClientID можно также задать в `public/app-config.js` (`GOOGLE_CLIENT_ID`); **Client Secret в код/репозиторий класть нельзя** — он хранится только в localStorage вашего браузера, в открытом коде приложения его нет.
 
-Особенности Google: OAuth authorization code + PKCE без секретов, токен живёт ~1 час и **обновляется тихо** в скрытом iframe (`prompt=none`), пока в браузере активна сессия Google — пароль заново вводить не нужно. Файл лежит в скрытой папке приложения (**appDataFolder**): в интерфейсе Drive он не виден, приложение видит только эту папку. Все запросы — `www.googleapis.com`, CORS поддерживается, прокси не нужны.
+Особенности Google: OAuth authorization code + PKCE, и Google для клиента «Web application» при обмене кода на токен дополнительно требует **client_secret** (иначе токен-эндпоинт отвечает 400). Секрет отправляется только в запросе обмена `code → token` на `oauth2.googleapis.com` из вашего браузера. Токен живёт ~1 час и **обновляется тихо** в скрытом iframe (`prompt=none`), пока в браузере активна сессия Google — пароль заново вводить не нужно. Файл лежит в скрытой папке приложения (**appDataFolder**): в интерфейсе Drive он не виден, приложение видит только эту папку. Все запросы — `www.googleapis.com`, CORS поддерживается, прокси не нужны.
 
 ## Как добавить устройство
 

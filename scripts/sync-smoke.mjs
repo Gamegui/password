@@ -84,8 +84,11 @@ try {
   assert.equal(await yandexProvider.completeRedirect(), null)
   console.log('2. Яндекс OAuth implicit: ok')
 
-  // ---- 3. Google: PKCE + authorization code ----
+  // ---- 3. Google: PKCE + authorization code (секрет обязателен) ----
   localStorage.setItem('safekey.google.clientId', 'g-client')
+  // без секрета вход должен отказать, не уходя на accounts.google.com
+  assert.throws(() => googleProvider.login('connect'), e => e.message === 'client_secret_missing')
+  localStorage.setItem('safekey.google.clientSecret', 'g-secret')
   googleProvider.login('connect')
   await new Promise(r => setTimeout(r, 20)) // login() асинхронно готовит PKCE
   const gUrl = new URL(globalThis.__lastAssign)
@@ -106,6 +109,7 @@ try {
     if (url.startsWith('https://oauth2.googleapis.com/token')) {
       const body = new URLSearchParams(String(init.body))
       assert.equal(body.get('client_id'), 'g-client')
+      assert.equal(body.get('client_secret'), 'g-secret', 'client_secret передаётся при обмене кода')
       assert.equal(body.get('code_verifier'), gVerifier)
       assert.equal(body.get('grant_type'), 'authorization_code')
       googleExchanged = body.get('code')
