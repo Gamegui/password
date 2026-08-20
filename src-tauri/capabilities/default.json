@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "SafeKey не использует привилегированные команды Tauri — только окно приложения",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -25,3 +25,14 @@
 .steps span{flex:none;width:22px;height:22px;border-radius:50%;background:#e6efe2;color:#2f6a56;font-size:10px;font-weight:800;display:grid;place-items:center}
 .steps p{font-size:9px;color:#7d8a85;margin:3px 0 0;line-height:1.6}
 @media(max-width:680px){.conflict-actions{grid-template-columns:1fr}}
+/* Выбор облака (Яндекс/Google) */
+.provider-cards{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.provider-card{border:1px solid var(--line);border-radius:14px;background:#fff;padding:14px;display:flex;flex-direction:column;gap:11px}
+.provider-head{display:flex;gap:11px;align-items:center;text-align:left}
+.provider-head strong{font-size:12px;display:block}
+.provider-head p{font-size:9px;color:#87928e;margin:3px 0 0;line-height:1.5}
+.provider-input{height:42px;border:1px solid #dce2dd;border-radius:10px;background:#f8f9f7;padding:0 12px;font-size:11px;outline:0;width:100%}
+.provider-input:focus{border-color:#5d8a7d;box-shadow:0 0 0 3px #e1ece7;background:#fff}
+.auth-panel .provider-cards{margin:6px 0 4px}
+.auth-panel .provider-input{background:#fff}
+@media(max-width:680px){.provider-cards{grid-template-columns:1fr}}

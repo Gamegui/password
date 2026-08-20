@@ -1,6 +1,6 @@
 // Service worker для офлайн-работы PWA.
 // Все пути относительные: приложение живёт в подкаталоге GitHub Pages (например /password/).
-const CACHE = 'safekey-shell-v2'
+const CACHE = 'safekey-shell-v3'
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './app-config.js']
 
 self.addEventListener('install', event => event.waitUntil(
