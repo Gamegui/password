@@ -14,19 +14,19 @@
     "test:cloud": "node scripts/cloud-smoke.mjs"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.2",
     "helmet": "^8.3.0",
     "lucide-react": "^0.468.0",
     "react": "latest",
-    "react-dom": "latest",
-    "typescript": "latest",
-    "vite": "latest"
+    "react-dom": "latest"
   },
   "devDependencies": {
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "concurrently": "^10.0.5"
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "^10.0.5",
+    "typescript": "latest",
+    "vite": "latest"
   }
 }
