@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowDownToLine, ArrowUpFromLine, Check, ChevronDown, ChevronRight, CircleHelp, Clipboard,
-  Cloud, Copy, CreditCard, Download, Eye, EyeOff, FileText, Fingerprint, Globe2, Heart,
-  KeyRound, Laptop, Lock, LogOut, Menu, MoreHorizontal, Plus, RefreshCw, Search, Settings,
-  Shield, ShieldCheck, ShieldEllipsis, Smartphone, Sparkles, Star, Trash2, Upload, UserRound, X, Zap
+  ArrowDownToLine, ArrowUpFromLine, Check, ChevronDown, ChevronRight, Cloud, Copy, CreditCard, Download,
+  ExternalLink, Eye, EyeOff, FileText, Fingerprint, Globe2, KeyRound, Laptop, Lock, LogOut, Menu,
+  MoreHorizontal, Plus, RefreshCw, Search, Settings, Shield, ShieldCheck, ShieldEllipsis, Smartphone,
+  Sparkles, Star, Trash2, Upload, UserRound, X, Zap
 } from 'lucide-react'
 import { decryptVault, encryptVault, generatePassword, strength } from './crypto'
-import { claimPairCode, clearSyncConfig, createCloud, createPairCode, getSyncConfig, pullCloud, pushCloud, type SyncConfig } from './sync'
+import {
+  activeProvider, beginLogin, completeOAuthRedirect, connectAccount, disconnectSync,
+  getSyncState, markSynced, providers, pullRemote, pushVault, type ProviderId, type SyncState
+} from './sync'
+import { getClientId as getYandexClientId, setClientId as setYandexClientId } from './yandex'
+import { getClientId as getGoogleClientId, setClientId as setGoogleClientId } from './gdrive'
 import type { EncryptedVault, VaultData, VaultItem } from './types'
 
 const STORAGE_KEY = 'safekey.encrypted.v1'
@@ -20,7 +25,7 @@ const demoItems: VaultItem[] = [
 ]
 
 type View = 'vault' | 'favorites' | 'audit' | 'sync' | 'settings'
-type AuthMode = 'welcome' | 'create' | 'unlock' | 'pair'
+type AuthMode = 'welcome' | 'create' | 'unlock' | 'cloud'
 
 const serviceColor = (title: string, category: VaultItem['category']) => {
   if (category === 'card') return ['#eef3ff', '#4569d4']
@@ -44,8 +49,25 @@ function App() {
   const [editItem, setEditItem] = useState<VaultItem | null | 'new'>(null)
   const [toast, setToast] = useState('')
   const [busy, setBusy] = useState(false)
+  // undefined — облако ещё не проверяли; null — на Диске сейфа нет; объект — скачанный сейф ждёт мастер-пароль
+  const [pendingCloud, setPendingCloud] = useState<EncryptedVault | null | undefined>(undefined)
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 2400) }
+
+  // Тихая автосинхронизация после каждого изменения: проверяем, что в облаке не появилось
+  // более новой версии (md5 как optimistic concurrency), и только затем перезаписываем файл.
+  const autoPush = async (encrypted: EncryptedVault) => {
+    const provider = activeProvider()
+    if (!provider) return
+    try {
+      const meta = await provider.fileMeta()
+      const state = getSyncState()
+      if (meta && state && meta.md5 !== state.lastMd5) { notify('В облаке более новая версия — откройте «Синхронизацию»'); return }
+      await pushVault(encrypted)
+    } catch (error: any) {
+      notify(error?.status === 401 ? 'Нужно снова войти в облако' : 'Сохранено локально — облако временно недоступно')
+    }
+  }
 
   const saveVault = async (next: VaultData) => {
     setVault(next)
@@ -54,12 +76,7 @@ function App() {
     const salt = old ? (JSON.parse(old) as EncryptedVault).salt : undefined
     const encrypted = await encryptVault(next, masterPassword, salt)
     localStorage.setItem(STORAGE_KEY, JSON.stringify(encrypted))
-    if (getSyncConfig()) {
-      pushCloud(encrypted).catch(error => {
-        if (error?.status === 409) notify('Есть новая облачная версия — откройте синхронизацию')
-        else notify('Сохранено локально, облако временно недоступно')
-      })
-    }
+    if (getSyncState()) autoPush(encrypted)
   }
 
   const createVault = async (password: string, demo = false) => {
@@ -86,27 +103,66 @@ function App() {
     return () => { window.clearTimeout(timer); events.forEach(event => window.removeEventListener(event, reset)) }
   }, [vault])
 
-  if (!vault) return <AuthScreen mode={mode} setMode={setMode} busy={busy} createVault={createVault} onPair={async (code, password) => {
-    setBusy(true)
+  // Возврат с OAuth: у Яндекса токен в #access_token=..., у Google код в ?code=...
+  useEffect(() => {
+    void (async () => {
+      const result = await completeOAuthRedirect()
+      if (!result) return
+      const cloud = providers[result.provider].title
+      if ('error' in result) { notify(`Вход через ${cloud} не завершён — попробуйте снова`); return }
+      setBusy(true)
+      try {
+        const state = await connectAccount(result.provider)
+        if (result.intent === 'connect') {
+          const remote = await providers[result.provider].download()
+          if (remote) { setPendingCloud(remote.vault); notify('Сейф из облака получен — введите мастер-пароль') }
+          else { setPendingCloud(null); notify('В этом облаке сейфа пока нет') }
+          setMode('cloud')
+        } else {
+          notify(`${cloud} подключён (${state.account.login}) — синхронизируйте сейф`)
+        }
+      } catch (error: any) {
+        notify(error?.status === 401 ? 'Токен недействителен — войдите заново' : `Не удалось связаться с ${cloud}`)
+        await disconnectSync()
+        setPendingCloud(undefined)
+      } finally { setBusy(false) }
+    })()
+  }, [])
+
+  if (!vault) return <AuthScreen mode={mode} setMode={setMode} busy={busy} pendingCloud={pendingCloud} createVault={createVault} onCloudLogin={(provider: ProviderId) => {
+    try { beginLogin(provider, 'connect') } catch { setMode('cloud'); notify('Сначала укажите ClientID приложения') }
+  }} onCloudUnlock={async password => {
+    if (!pendingCloud) return false
     try {
-      const result = await claimPairCode(code, /Mobi|Android/i.test(navigator.userAgent) ? 'Мой телефон' : 'Мой компьютер')
-      const data = await decryptVault(result.blob, password)
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(result.blob))
-      setMasterPassword(password); setVault(data); return true
-    } catch { clearSyncConfig(); return false } finally { setBusy(false) }
-  }} onUnlock={async password => {
+      const data = await decryptVault(pendingCloud, password)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingCloud))
+      const meta = await activeProvider()?.fileMeta().catch(() => null)
+      if (meta) markSynced(meta.md5, meta.modified, meta.size)
+      setMasterPassword(password); setVault(data)
+      notify('Облачный сейф расшифрован и сохранён на этом устройстве')
+      return true
+    } catch { return false }
+  }} onCloudReset={() => { setPendingCloud(undefined); setMode(stored ? 'unlock' : 'welcome') }} onUnlock={async password => {
     setBusy(true)
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
       if (!raw) return false
-      let encrypted = JSON.parse(raw) as EncryptedVault
+      const encrypted = JSON.parse(raw) as EncryptedVault
       let data = await decryptVault(encrypted, password)
       setMasterPassword(password); setVault(data)
-      if (getSyncConfig()) pullCloud().then(async remote => {
-        if (new Date(remote.blob.updatedAt) > new Date(encrypted.updatedAt)) {
-          data = await decryptVault(remote.blob, password)
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(remote.blob))
+      if (getSyncState()) pullRemote().then(async remote => {
+        if (!remote.changed || !remote.vault) return
+        const snap = getSyncState()
+        const localDirty = Boolean(snap?.lastSync && new Date(encrypted.updatedAt) > new Date(snap.lastSync))
+        if (localDirty) { notify('Диск изменён с другого устройства — откройте «Синхронизацию»'); return }
+        if (new Date(remote.vault.updatedAt) >= new Date(encrypted.updatedAt)) {
+          data = await decryptVault(remote.vault, password)
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(remote.vault))
+          markSynced(remote.md5, remote.modified, 0)
           setVault(data)
+          notify('Загружена более новая версия с Яндекс Диска')
+        } else {
+          await pushVault(encrypted)
         }
       }).catch(() => undefined)
       return true
@@ -137,7 +193,7 @@ function App() {
       </nav>
       <div className="sidebar-bottom">
         <button className={view === 'settings' ? 'nav-item active' : 'nav-item'} onClick={() => setView('settings')}><Settings size={19} />Настройки</button>
-        <div className="user-card"><div className="avatar">АК</div><div><strong>Моё хранилище</strong><span>Локальный сейф</span></div><button onClick={lock} title="Заблокировать"><LogOut size={18} /></button></div>
+        <div className="user-card"><div className="avatar">АК</div><div><strong>Моё хранилище</strong><span>{getSyncState() ? 'Яндекс Диск' : 'Локальный сейф'}</span></div><button onClick={lock} title="Заблокировать"><LogOut size={18} /></button></div>
       </div>
     </aside>
     {menuOpen && <div className="backdrop" onClick={() => setMenuOpen(false)} />}
@@ -146,7 +202,7 @@ function App() {
       <header className="topbar">
         <button className="menu-button" onClick={() => setMenuOpen(true)}><Menu /></button>
         <div className="search"><Search size={19} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Поиск в хранилище..." /><kbd>⌘ K</kbd></div>
-        <div className="top-actions"><div className="sync-state"><Cloud size={17} /><span>Защищено локально</span></div><button className="icon-button" onClick={() => setView('settings')}><Settings size={20} /></button><button className="avatar small" onClick={() => setView('settings')}>АК</button></div>
+        <div className="top-actions"><div className="sync-state"><Cloud size={17} /><span>{getSyncState() ? 'Синхронизация · Яндекс Диск' : 'Защищено локально'}</span></div><button className="icon-button" onClick={() => setView('settings')}><Settings size={20} /></button><button className="avatar small" onClick={() => setView('settings')}>АК</button></div>
       </header>
 
       {(view === 'vault' || view === 'favorites') && <VaultView items={visibleItems} total={vault.items.length} query={query} favorite={view === 'favorites'} onAdd={() => setEditItem('new')} onEdit={setEditItem} onToggle={item => saveVault({ ...vault, items: vault.items.map(x => x.id === item.id ? { ...x, favorite: !x.favorite } : x), updatedAt: new Date().toISOString() })} notify={notify} />}
@@ -179,39 +235,87 @@ function App() {
   </div>
 }
 
-function AuthScreen({ mode, setMode, busy, createVault, onUnlock, onPair }: { mode: AuthMode; setMode: (m: AuthMode) => void; busy: boolean; createVault: (p: string, demo?: boolean) => Promise<void>; onUnlock: (p: string) => Promise<boolean>; onPair: (code: string, password: string) => Promise<boolean> }) {
+function ProviderConnect({ onLogin }: { onLogin: (provider: ProviderId) => void }) {
+  const [yandexId, setYandexId] = useState(getYandexClientId())
+  const [googleId, setGoogleId] = useState(getGoogleClientId())
+  return <div className="provider-cards">
+    <div className="provider-card">
+      <div className="provider-head"><span className="stat-icon green"><Cloud size={17} /></span><div><strong>Яндекс Диск</strong><p>Папка «Приложения/SafeKey» · долгоживущий токен</p></div></div>
+      {!yandexId.trim() && <>
+        <input className="provider-input" value={yandexId} onChange={e => setYandexId(e.target.value)} placeholder="ClientID с oauth.yandex.ru" />
+        <p className="cloud-hint">Приложение на <a href="https://oauth.yandex.ru/client/new" target="_blank" rel="noreferrer">oauth.yandex.ru <ExternalLink size={10} style={{ display: 'inline-block' }} /></a>: «Веб-сервисы», Redirect URI — адрес этой страницы, доступ «папка приложения» (подробно — README).</p>
+      </>}
+      <button className="secondary full" disabled={!yandexId.trim()} onClick={() => { setYandexClientId(yandexId); onLogin('yandex') }}>Войти через Яндекс</button>
+    </div>
+    <div className="provider-card">
+      <div className="provider-head"><span className="stat-icon blue"><Cloud size={17} /></span><div><strong>Google Drive</strong><p>Скрытая папка приложения (appDataFolder)</p></div></div>
+      {!googleId.trim() && <>
+        <input className="provider-input" value={googleId} onChange={e => setGoogleId(e.target.value)} placeholder="ClientID с Google Cloud Console" />
+        <p className="cloud-hint">OAuth-клиент «Web application» в <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud Console <ExternalLink size={10} style={{ display: 'inline-block' }} /></a>: JS-origins и Redirect URI — адрес этой страницы, scope <code>drive.appdata</code> (подробно — README).</p>
+      </>}
+      <button className="secondary full" disabled={!googleId.trim()} onClick={() => { setGoogleClientId(googleId); onLogin('google') }}>Войти через Google</button>
+    </div>
+  </div>
+}
+
+function AuthScreen({ mode, setMode, busy, pendingCloud, createVault, onUnlock, onCloudLogin, onCloudUnlock, onCloudReset }: { mode: AuthMode; setMode: (m: AuthMode) => void; busy: boolean; pendingCloud: EncryptedVault | null | undefined; createVault: (p: string, demo?: boolean) => Promise<void>; onUnlock: (p: string) => Promise<boolean>; onCloudLogin: (provider: ProviderId) => void; onCloudUnlock: (p: string) => Promise<boolean>; onCloudReset: () => void }) {
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
-  const [code, setCode] = useState('')
   const [show, setShow] = useState(false)
   const [error, setError] = useState('')
 
   if (mode === 'welcome') return <div className="auth-page welcome-page">
     <div className="welcome-nav"><Logo /><span><ShieldCheck size={16} /> Нулевое знание</span></div>
     <div className="welcome-content">
-      <div className="welcome-copy"><span className="eyebrow"><Sparkles size={15} /> Ваш цифровой сейф</span><h1>Пароли под защитой.<br/><em>Спокойствие внутри.</em></h1><p>SafeKey шифрует данные прямо на вашем устройстве. Только вы можете открыть своё хранилище — даже мы не знаем, что внутри.</p><div className="welcome-buttons"><button className="primary large" onClick={() => setMode('create')}>Создать хранилище <ChevronRight size={19} /></button><button className="secondary large" onClick={() => setMode('pair')}><Cloud size={18}/> Подключить устройство</button><button className="secondary large" onClick={() => createVault('Demo-SafeKey-2026!', true)}>Демо</button></div><div className="trust-row"><span><Check /> AES-256-GCM</span><span><Check /> Работает офлайн</span><span><Check /> Без рекламы</span></div></div>
+      <div className="welcome-copy"><span className="eyebrow"><Sparkles size={15} /> Ваш цифровой сейф</span><h1>Пароли под защитой.<br/><em>Спокойствие внутри.</em></h1><p>SafeKey шифрует данные прямо на вашем устройстве. Только вы можете открыть своё хранилище — даже мы не знаем, что внутри.</p><div className="welcome-buttons"><button className="primary large" onClick={() => setMode('create')}>Создать хранилище <ChevronRight size={19} /></button><button className="secondary large" onClick={() => setMode('cloud')}><Cloud size={18}/> Облачный сейф</button><button className="secondary large" onClick={() => createVault('Demo-SafeKey-2026!', true)}>Демо</button></div><div className="trust-row"><span><Check /> AES-256-GCM</span><span><Check /> Работает офлайн</span><span><Check /> Без серверов</span></div></div>
       <div className="safe-visual"><div className="orbit one"><Shield /></div><div className="orbit two"><Fingerprint /></div><div className="safe-card"><div className="safe-glow"><Lock size={50} /></div><strong>Ваше хранилище</strong><span>Зашифровано на устройстве</span><div className="encryption-line"><i /><small>AES-256</small><i /></div></div><div className="float-card top"><ShieldCheck /> Надёжное шифрование</div><div className="float-card bottom"><Zap /> Мгновенный доступ</div></div>
     </div>
   </div>
 
+  if (mode === 'cloud') return <div className="auth-page lock-page"><div className="auth-brand"><Logo light /></div><div className="auth-panel">
+    <div className="lock-icon"><Cloud size={28} /></div>
+    <p className="auth-overline">ОБЛАКО</p>
+    {pendingCloud === undefined && <>
+      <h1>Подключить облачный сейф</h1>
+      <p>Выберите, где хранить зашифрованную копию: файл в папке приложения виден только SafeKey — и Яндекс, и Google получают лишь шифротекст.</p>
+      <ProviderConnect onLogin={onCloudLogin} />
+      <button className="text-button" onClick={onCloudReset}>← Назад</button>
+    </>}
+    {pendingCloud === null && <>
+      <h1>В облаке сейфа нет</h1>
+      <p>Файл safekey.vault не найден. Создайте хранилище на этом устройстве, затем включите синхронизацию — зашифрованная копия появится в облаке.</p>
+      <button className="primary auth-submit" onClick={onCloudReset}>← К началу</button>
+    </>}
+    {pendingCloud && <>
+      <h1>Мастер-пароль облачного сейфа</h1>
+      <p>Введите мастер-пароль, которым зашифрован сейф с Яндекс Диска.</p>
+      <form onSubmit={async e => {
+        e.preventDefault(); setError('')
+        if (!await onCloudUnlock(password)) setError('Неверный мастер-пароль этого сейфа')
+      }}>
+        <label>Мастер-пароль</label>
+        <div className="password-field"><input autoFocus type={show ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder="Мастер-пароль сейфа" /><button type="button" onClick={() => setShow(!show)}>{show ? <EyeOff /> : <Eye />}</button></div>
+        {error && <div className="form-error">{error}</div>}
+        <button className="primary auth-submit" disabled={busy || !password}>{busy ? <RefreshCw className="spin" /> : <Lock size={16} />}Расшифровать и открыть</button>
+      </form>
+      <button className="text-button" onClick={onCloudReset}>← Отмена</button>
+    </>}
+    <div className="auth-security"><ShieldCheck size={17} />Яндекс видит только зашифрованный файл</div>
+  </div></div>
+
   const creating = mode === 'create'
-  const pairing = mode === 'pair'
-  return <div className="auth-page lock-page"><div className="auth-brand"><Logo light /></div><div className="auth-panel"><div className="lock-icon">{pairing ? <Cloud size={28}/> : <Lock size={28} />}</div><p className="auth-overline">SAFEKEY</p><h1>{creating ? 'Создайте мастер-пароль' : pairing ? 'Подключить устройство' : 'С возвращением'}</h1><p>{creating ? 'Это единственный ключ к вашим данным. Мы не сможем его восстановить.' : pairing ? 'Введите одноразовый код со своего подключённого устройства' : 'Введите мастер-пароль, чтобы открыть хранилище'}</p><form onSubmit={async e => {
+  return <div className="auth-page lock-page"><div className="auth-brand"><Logo light /></div><div className="auth-panel"><div className="lock-icon"><Lock size={28} /></div><p className="auth-overline">SAFEKEY</p><h1>{creating ? 'Создайте мастер-пароль' : 'С возвращением'}</h1><p>{creating ? 'Это единственный ключ к вашим данным. Мы не сможем его восстановить.' : 'Введите мастер-пароль, чтобы открыть хранилище'}</p><form onSubmit={async e => {
     e.preventDefault(); setError('')
     if (creating) {
       if (password.length < 10) return setError('Используйте минимум 10 символов')
       if (password !== confirm) return setError('Пароли не совпадают')
       await createVault(password)
-    } else if (pairing) {
-      if (code.length !== 6) return setError('Введите шестизначный код')
-      if (!await onPair(code, password)) setError('Код истёк или мастер-пароль не подходит')
     } else if (!await onUnlock(password)) setError('Неверный мастер-пароль')
   }}>
-    {pairing && <><label>Код подключения</label><div className="pair-auth-code"><input autoFocus inputMode="numeric" maxLength={6} value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ''))} placeholder="000000" /></div></>}
-    <label>Мастер-пароль</label><div className="password-field"><input autoFocus={!pairing} type={show ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder="Введите мастер-пароль" /><button type="button" onClick={() => setShow(!show)}>{show ? <EyeOff /> : <Eye />}</button></div>
+    <label>Мастер-пароль</label><div className="password-field"><input autoFocus type={show ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder="Введите мастер-пароль" /><button type="button" onClick={() => setShow(!show)}>{show ? <EyeOff /> : <Eye />}</button></div>
     {creating && <><div className="strength-bars">{[1,2,3,4].map(x => <i key={x} className={strength(password) >= x ? `on s${strength(password)}` : ''} />)}</div><label>Повторите пароль</label><div className="password-field"><input type="password" value={confirm} onChange={e => setConfirm(e.target.value)} placeholder="Ещё раз" /></div></>}
-    {error && <div className="form-error">{error}</div>}<button className="primary auth-submit" disabled={busy}>{busy ? <RefreshCw className="spin" /> : creating ? 'Создать защищённый сейф' : pairing ? 'Подключить и скачать сейф' : 'Открыть хранилище'}{!busy && <ChevronRight size={19} />}</button>
-  </form>{!creating && !pairing && localStorage.getItem('safekey.demo') && <button className="secondary demo-unlock" disabled={busy} onClick={() => onUnlock('Demo-SafeKey-2026!')}>Открыть демо без пароля</button>}{(creating || pairing) && <button className="text-button" onClick={() => setMode('welcome')}>← Назад</button>}<div className="auth-security"><ShieldCheck size={17} />Данные никогда не покидают устройство в открытом виде</div></div></div>
+    {error && <div className="form-error">{error}</div>}<button className="primary auth-submit" disabled={busy}>{busy ? <RefreshCw className="spin" /> : creating ? 'Создать защищённый сейф' : 'Открыть хранилище'}{!busy && <ChevronRight size={19} />}</button>
+  </form>{!creating && localStorage.getItem('safekey.demo') && <button className="secondary demo-unlock" disabled={busy} onClick={() => onUnlock('Demo-SafeKey-2026!')}>Открыть демо без пароля</button>}{creating && <button className="text-button" onClick={() => setMode('welcome')}>← Назад</button>}<div className="auth-security"><ShieldCheck size={17} />Данные никогда не покидают устройство в открытом виде</div></div></div>
 }
 
 function VaultView({ items, total, query, favorite, onAdd, onEdit, onToggle, notify }: { items: VaultItem[]; total: number; query: string; favorite: boolean; onAdd: () => void; onEdit: (i: VaultItem) => void; onToggle: (i: VaultItem) => void; notify: (s: string) => void }) {
@@ -245,72 +349,114 @@ function AuditView({ items, onOpen }: { items: VaultItem[]; onOpen: (i: VaultIte
 }
 
 function SyncView({ vault, notify, onRemote }: { vault: VaultData; notify: (s: string) => void; onRemote: (blob: EncryptedVault) => Promise<boolean> }) {
-  const [config, setConfig] = useState<SyncConfig | null>(() => getSyncConfig())
-  const [pairCode, setPairCode] = useState('')
-  const [claimCode, setClaimCode] = useState('')
-  const [devices, setDevices] = useState<Array<{id:string;name:string;lastSeen:string}>>([])
+  const [state, setState] = useState<SyncState | null>(() => getSyncState())
   const [busy, setBusy] = useState(false)
   const [online, setOnline] = useState<boolean | null>(null)
-  const deviceName = /Mobi|Android/i.test(navigator.userAgent) ? 'Мой телефон' : 'Мой компьютер'
+  const [conflict, setConflict] = useState<null | { remoteUpdated: string; localUpdated: string }>(null)
+  const started = useRef(false)
+
+  const localBlob = (): EncryptedVault | null => {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? JSON.parse(raw) as EncryptedVault : null
+  }
+
+  const applyRemote = async (remote: { vault: EncryptedVault; md5: string; modified: string }) => {
+    if (!await onRemote(remote.vault)) {
+      notify('Мастер-пароль этого устройства не подходит к облачному сейфу')
+      return false
+    }
+    setState(markSynced(remote.md5, remote.modified, 0))
+    return true
+  }
 
   const run = async (job: () => Promise<void>) => {
     setBusy(true)
     try { await job(); setOnline(true) } catch (error: any) {
       setOnline(false)
-      notify(error?.status === 409 ? 'Конфликт версий — сначала загрузите облачную копию' : 'Не удалось связаться с SafeKey Cloud')
+      notify(error?.status === 401 ? 'Нужно снова войти в Яндекс' : 'Не удалось связаться с Яндекс Диском')
     } finally { setBusy(false) }
   }
 
-  const enableCloud = () => run(async () => {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) throw new Error('no_vault')
-    const next = await createCloud(JSON.parse(raw), deviceName)
-    setConfig(next)
-    notify('Облачная синхронизация включена')
-  })
+  const resolveRemote = async (pull: { vault: EncryptedVault | null; md5: string; modified: string; changed: boolean }) => {
+    const local = localBlob()
+    const snap = getSyncState()
+    const localChanged = Boolean(local && snap?.lastSync && new Date(local.updatedAt) > new Date(snap.lastSync))
+    if (!pull.changed) {
+      if (local && (!snap?.lastSync || new Date(local.updatedAt) > new Date(snap.lastSync))) {
+        setState(await pushVault(local))
+        notify('Локальные изменения отправлены на Диск')
+      } else notify('Сейф уже синхронизирован')
+      return
+    }
+    if (!pull.vault) {
+      if (local) { setState(await pushVault(local)); notify('Сейф заново сохранён на Диске') }
+      return
+    }
+    const remote = { vault: pull.vault, md5: pull.md5, modified: pull.modified }
+    if (!local) { await applyRemote(remote); return }
+    // локальная копия менялась после последней синхронизации ИЛИ это первая сверка
+    // с уже существующим файлом на Диске — обе версии ценны, спрашиваем пользователя
+    if (localChanged || !snap?.lastSync) setConflict({ remoteUpdated: pull.vault.updatedAt, localUpdated: local.updatedAt })
+    else await applyRemote(remote)
+  }
 
   const syncNow = () => run(async () => {
-    const remote = await pullCloud()
-    setDevices(remote.devices)
-    const localRaw = localStorage.getItem(STORAGE_KEY)
-    const local = localRaw ? JSON.parse(localRaw) as EncryptedVault : null
-    if (!local || new Date(remote.blob.updatedAt) > new Date(local.updatedAt)) {
-      if (!await onRemote(remote.blob)) return
-    } else if (local.updatedAt !== remote.blob.updatedAt) {
-      const next = await pushCloud(local, remote.config)
-      setConfig(next)
-    }
-    setConfig(getSyncConfig())
-    notify('Сейф синхронизирован')
+    setConflict(null)
+    await resolveRemote(await pullRemote())
+    setState(getSyncState())
   })
 
-  const generateCode = () => run(async () => {
-    const result = await createPairCode()
-    setPairCode(result.code)
-    notify('Одноразовый код создан')
+  const takeRemote = () => run(async () => {
+    const pull = await pullRemote()
+    if (pull.vault) await applyRemote({ vault: pull.vault, md5: pull.md5, modified: pull.modified })
+    setConflict(null)
   })
 
-  const claim = () => run(async () => {
-    const result = await claimPairCode(claimCode, deviceName)
-    if (!await onRemote(result.blob)) { clearSyncConfig(); return }
-    setConfig(result.config)
-    setClaimCode('')
-    notify('Устройство подключено к облачному сейфу')
+  const keepLocal = () => run(async () => {
+    const local = localBlob()
+    if (local) setState(await pushVault(local))
+    setConflict(null)
+    notify('Локальная версия отправлена на Диск')
   })
 
-  return <section className="content"><div className="page-heading"><div><p className="overline">SAFEKEY CLOUD</p><h1>Облачная синхронизация</h1><p>Зашифрованный сейф на всех ваших устройствах</p></div>{config ? <button className="primary" disabled={busy} onClick={syncNow}>{busy ? <RefreshCw className="spin" /> : <RefreshCw />}Синхронизировать</button> : <button className="primary" disabled={busy} onClick={enableCloud}>{busy ? <RefreshCw className="spin" /> : <Cloud />}Включить облако</button>}</div>
-    <div className="sync-hero"><div className="sync-art"><div className="device laptop"><Laptop /></div><div className="sync-path"><i/><RefreshCw className={busy ? 'spin' : ''}/><i/></div><div className="device phone"><Smartphone /></div></div><div><span className="good-label"><Lock /> Zero knowledge</span><h2>Сервер никогда не видит ваши пароли</h2><p>Перед отправкой сейф шифруется AES-256-GCM прямо на устройстве. Облако хранит только шифротекст, а мастер-пароль и ключи остаются у вас.</p></div></div>
-    <div className="cloud-status"><span className={`cloud-status-icon ${config ? 'connected' : ''}`}><Cloud /></span><div><strong>{config ? 'SafeKey Cloud подключён' : 'Облако ещё не подключено'}</strong><p>{config ? `Версия ${config.revision} · ${config.lastSync ? `последняя синхронизация ${new Date(config.lastSync).toLocaleString('ru-RU')}` : 'готово к синхронизации'}` : 'Включите облако, чтобы получить защищённую копию сейфа'}</p></div><span className={online === false ? 'cloud-pill error' : config ? 'cloud-pill' : 'cloud-pill muted'}><i/>{online === false ? 'Нет связи' : config ? 'Активно' : 'Выключено'}</span></div>
-    <div className="two-col"><div className="settings-card"><div className="card-title"><div><h3>Подключённые устройства</h3><p>{devices.length ? `${devices.length} устройства` : 'Синхронизируйте, чтобы обновить список'}</p></div>{config && <span className="online"><i/> Сквозное шифрование</span>}</div><div className="device-row"><span><Laptop /></span><div><strong>{deviceName}</strong><p>Это устройство · {vault.items.length} записей</p></div><em>Текущее</em></div>{devices.filter(d => d.name !== deviceName).map(device => <div className="device-row" key={device.id}><span><Smartphone /></span><div><strong>{device.name}</strong><p>Был в сети {new Date(device.lastSeen).toLocaleString('ru-RU')}</p></div><ShieldCheck size={18}/></div>)}</div>
-      <div className="settings-card pair-card"><div className="card-title"><div><h3>Добавить устройство</h3><p>Одноразовый код действует 10 минут</p></div></div>{config ? <>{pairCode ? <><div className="pair-code">{pairCode.split('').map((x,i) => <b key={i}>{x}</b>)}</div><p>Введите этот код на втором устройстве</p><button className="secondary full" onClick={() => { navigator.clipboard.writeText(pairCode); notify('Код скопирован') }}><Clipboard />Скопировать код</button></> : <button className="secondary full" disabled={busy} onClick={generateCode}><Smartphone />Создать код подключения</button>}</> : <><div className="claim-field"><input inputMode="numeric" maxLength={6} value={claimCode} onChange={e => setClaimCode(e.target.value.replace(/\D/g, ''))} placeholder="000 000" /></div><p>Код отображается на уже подключённом устройстве</p><button className="secondary full" disabled={busy || claimCode.length !== 6} onClick={claim}><ArrowDownToLine />Подключиться по коду</button></>}</div></div>
-    <div className="info-box"><ShieldCheck /><div><strong>Настоящая zero-knowledge синхронизация</strong><p>Сервер проверяет секретный токен устройства, хранит версии и разрешает одноразовое подключение. Даже при утечке серверной базы злоумышленник получит только AES-GCM шифротекст. Не забывайте мастер-пароль: восстановить его невозможно.</p></div></div>
-    {config && <button className="disconnect-cloud" onClick={() => { clearSyncConfig(); setConfig(null); setPairCode(''); notify('Это устройство отключено от облака') }}>Отключить облако на этом устройстве</button>}
+  // Первое подключение: сразу сводим локальный сейф с Диском
+  useEffect(() => {
+    if (started.current) return
+    started.current = true
+    if (state && !state.lastMd5) syncNow()
+  }, [])
+
+  const login = (provider: ProviderId) => {
+    try { beginLogin(provider, 'sync') }
+    catch { notify('Сначала укажите ClientID приложения') }
+  }
+
+  const logout = () => run(async () => {
+    await disconnectSync()
+    setState(null); setOnline(null)
+    notify('Синхронизация отключена, токен отозван')
+  })
+
+  const cloud = state ? providers[state.provider].title : null
+  return <section className="content"><div className="page-heading"><div><p className="overline">СИНХРОНИЗАЦИЯ</p><h1>Синхронизация</h1><p>Зашифрованный сейф на всех устройствах — без сервера SafeKey</p></div>{state && <button className="primary" disabled={busy} onClick={syncNow}>{busy ? <RefreshCw className="spin" /> : <RefreshCw />}Синхронизировать</button>}</div>
+    <div className="sync-hero"><div className="sync-art"><div className="device laptop"><Laptop /></div><div className="sync-path"><i/><RefreshCw className={busy ? 'spin' : ''}/><i/></div><div className="device phone"><Smartphone /></div></div><div><span className="good-label"><Lock /> Zero knowledge</span><h2>Своих серверов нет</h2><p>Сейф шифруется на устройстве (AES-256-GCM) и в таком виде хранится в папке приложения — на Яндекс Диске или в Google Drive, как выберете. Ключ остаётся только у вас: облако и SafeKey видят лишь шифротекст.</p></div></div>
+    <div className="cloud-status"><span className={`cloud-status-icon ${state ? 'connected' : ''}`}><Cloud /></span><div><strong>{state ? `${cloud}: ${state.account.login}` : 'Облако не подключено'}</strong><p>{state ? `Файл safekey.vault · ${state.lastSync ? `синхронизировано ${new Date(state.lastSync).toLocaleString('ru-RU')}` : 'первая синхронизация...'}` : 'Войдите через Яндекс или Google, чтобы хранить зашифрованную копию сейфа в своём облаке'}</p></div><span className={online === false ? 'cloud-pill error' : state ? 'cloud-pill' : 'cloud-pill muted'}><i/>{online === false ? 'Нет связи' : state ? 'Активно' : 'Выключено'}</span></div>
+
+    {conflict && <div className="settings-card conflict-card"><div className="card-title"><span className="stat-icon amber"><RefreshCw /></span><div><h3>Обе версии изменены</h3><p>Локально: {new Date(conflict.localUpdated).toLocaleString('ru-RU')} · в облаке: {new Date(conflict.remoteUpdated).toLocaleString('ru-RU')}</p></div></div><div className="conflict-actions"><button className="secondary full" disabled={busy} onClick={takeRemote}><ArrowDownToLine /> Загрузить из облака</button><button className="secondary full" disabled={busy} onClick={keepLocal}><ArrowUpFromLine /> Отправить локальную</button></div><p className="conflict-note">Выбранная версия перезапишет вторую. Если нужны обе — сначала экспортируйте копию в настройках.</p></div>}
+
+    {!state && <div className="settings-card"><div className="card-title"><div><h3>Подключить облако</h3><p>Бесплатно · только папка приложения · только шифротекст</p></div></div><ProviderConnect onLogin={login} /></div>}
+
+    <div className="two-col"><div className="settings-card"><div className="card-title"><div><h3>Как устроена синхронизация</h3><p>Контроль версий по md5, перезапись — только с вашего согласия</p></div>{state && <span className="online"><i/> Шифротекст</span>}</div><div className="device-row"><span><Laptop /></span><div><strong>Изменения шифруются локально</strong><p>Каждое сохранение: AES-256-GCM со свежим IV, затем файл уходит в облако</p></div><ShieldCheck size={18} /></div><div className="device-row"><span><Cloud /></span><div><strong>Облако хранит только шифротекст</strong><p>Яндекс — «Приложения/SafeKey/safekey.vault» (файл виден в Диске), Google — скрытая папка appDataFolder</p></div><Lock size={16} /></div><div className="device-row"><span><Smartphone /></span><div><strong>Конфликты решаете вы</strong><p>Если менялись обе копии, SafeKey спросит, какую оставить</p></div><RefreshCw size={16} /></div></div>
+      <div className="settings-card pair-card"><div className="card-title"><div><h3>Добавить устройство</h3><p>Тот же облачный аккаунт и тот же мастер-пароль</p></div></div><div className="steps"><span>1</span><p>Откройте SafeKey на новом устройстве — установите PWA с того же адреса</p></div><div className="steps"><span>2</span><p>На экране входа нажмите «Облачный сейф» и войдите в тот же Яндекс или Google</p></div><div className="steps"><span>3</span><p>Введите мастер-пароль сейфа — данные расшифруются уже на устройстве</p></div></div></div>
+    <div className="info-box"><ShieldCheck /><div><strong>Zero-knowledge даже для облака</strong><p>В облако уходит только AES-GCM шифротекст; мастер-пароль и ключ никогда не покидают устройство. Токен Google живёт недолго и обновляется тихо, пока активна сессия. Потерянный мастер-пароль восстановить невозможно — держите резервную копию (.skvault) в настройках.</p></div></div>
+    {state && <button className="disconnect-cloud" onClick={logout}>Отключиться от {cloud} и отозвать токен</button>}
   </section>
 }
+
 function SettingsView({ vault, onImport, onLock, notify }: { vault: VaultData; onImport: (v: EncryptedVault) => void; onLock: () => void; notify: (s: string) => void }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const exportVault = () => { const raw = localStorage.getItem(STORAGE_KEY); if (!raw) return; const blob = new Blob([raw], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `safekey-backup-${new Date().toISOString().slice(0,10)}.skvault`; a.click(); URL.revokeObjectURL(url); notify('Зашифрованная копия сохранена') }
-  return <section className="content settings-page"><div className="page-heading"><div><p className="overline">ПАРАМЕТРЫ</p><h1>Настройки</h1><p>Управляйте безопасностью и резервными копиями</p></div></div><div className="settings-layout"><div className="settings-card"><div className="card-title"><span className="stat-icon green"><Shield /></span><div><h3>Безопасность</h3><p>Защита локального хранилища</p></div></div><div className="setting-row"><div><strong>Автоблокировка</strong><p>Блокировать сейф после периода бездействия</p></div><button className="select-button">Через 15 минут <ChevronDown /></button></div><div className="setting-row"><div><strong>Биометрия</strong><p>Разблокировка через Face ID или отпечаток</p></div><button className="toggle" onClick={e => e.currentTarget.classList.toggle('on')}><i /></button></div><div className="setting-row"><div><strong>Заблокировать сейчас</strong><p>Мастер-ключ будет удалён из памяти</p></div><button className="secondary" onClick={onLock}><Lock />Заблокировать</button></div></div><div className="settings-card"><div className="card-title"><span className="stat-icon blue"><Cloud /></span><div><h3>Резервная копия</h3><p>Последнее изменение: {new Date(vault.updatedAt).toLocaleString('ru-RU')}</p></div></div><div className="backup-actions"><button onClick={exportVault}><span><Download /></span><div><strong>Экспортировать сейф</strong><p>Скачать зашифрованный файл</p></div><ChevronRight /></button><button onClick={() => inputRef.current?.click()}><span><Upload /></span><div><strong>Восстановить из файла</strong><p>Импортировать .skvault</p></div><ChevronRight /></button><input ref={inputRef} hidden type="file" accept=".skvault,.json" onChange={async e => { const file = e.target.files?.[0]; if (!file) return; try { onImport(JSON.parse(await file.text())) } catch { notify('Файл повреждён или имеет неверный формат') } }} /></div></div><div className="settings-card"><div className="card-title"><span className="stat-icon amber"><UserRound /></span><div><h3>О приложении</h3><p>SafeKey 1.0 · Offline-first PWA</p></div></div><div className="setting-row"><div><strong>Шифрование</strong><p>AES-256-GCM · PBKDF2-SHA-256 · 600 000 итераций</p></div><span className="verified"><Check /> Активно</span></div><div className="setting-row"><div><strong>Хранение</strong><p>Только на этом устройстве</p></div><span>{vault.items.length} записей</span></div></div></div></section>
+  return <section className="content settings-page"><div className="page-heading"><div><p className="overline">ПАРАМЕТРЫ</p><h1>Настройки</h1><p>Управляйте безопасностью и резервными копиями</p></div></div><div className="settings-layout"><div className="settings-card"><div className="card-title"><span className="stat-icon green"><Shield /></span><div><h3>Безопасность</h3><p>Защита локального хранилища</p></div></div><div className="setting-row"><div><strong>Автоблокировка</strong><p>Блокировать сейф после периода бездействия</p></div><button className="select-button">Через 15 минут <ChevronDown /></button></div><div className="setting-row"><div><strong>Биометрия</strong><p>Разблокировка через Face ID или отпечаток</p></div><button className="toggle" onClick={e => e.currentTarget.classList.toggle('on')}><i /></button></div><div className="setting-row"><div><strong>Заблокировать сейчас</strong><p>Мастер-ключ будет удалён из памяти</p></div><button className="secondary" onClick={onLock}><Lock />Заблокировать</button></div></div><div className="settings-card"><div className="card-title"><span className="stat-icon blue"><Cloud /></span><div><h3>Резервная копия</h3><p>Последнее изменение: {new Date(vault.updatedAt).toLocaleString('ru-RU')}</p></div></div><div className="backup-actions"><button onClick={exportVault}><span><Download /></span><div><strong>Экспортировать сейф</strong><p>Скачать зашифрованный файл</p></div><ChevronRight /></button><button onClick={() => inputRef.current?.click()}><span><Upload /></span><div><strong>Восстановить из файла</strong><p>Импортировать .skvault</p></div><ChevronRight /></button><input ref={inputRef} hidden type="file" accept=".skvault,.json" onChange={async e => { const file = e.target.files?.[0]; if (!file) return; try { onImport(JSON.parse(await file.text())) } catch { notify('Файл повреждён или имеет неверный формат') } }} /></div></div><div className="settings-card"><div className="card-title"><span className="stat-icon amber"><UserRound /></span><div><h3>О приложении</h3><p>SafeKey 1.1 · PWA без сервера</p></div></div><div className="setting-row"><div><strong>Шифрование</strong><p>AES-256-GCM · PBKDF2-SHA-256 · 600 000 итераций</p></div><span className="verified"><Check /> Активно</span></div><div className="setting-row"><div><strong>Хранение</strong><p>{getSyncState() ? `Устройство + зашифрованный файл (${providers[getSyncState()!.provider].title})` : 'Только на этом устройстве'}</p></div><span>{vault.items.length} записей</span></div></div></div></section>
 }
 
 export default App

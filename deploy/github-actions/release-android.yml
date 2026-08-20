@@ -1,0 +1,68 @@
+name: Build Android APK
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Android SDK (NDK + platform)
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "ndk;27.0.12077973" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+      - name: NDK_HOME
+        run: echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Иконки приложения
+        run: npx --yes @tauri-apps/cli@2 icon public/icon-512.png
+      - name: Инициализация Android-проекта
+        run: npx --yes @tauri-apps/cli@2 android init
+      - name: Самоподписанный ключ APK
+        run: |
+          keytool -genkeypair -v -keystore "$GITHUB_WORKSPACE/safekey.keystore" \
+            -storepass safekey123456 -keypass safekey123456 -alias safekey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=SafeKey, OU=Personal, O=SafeKey"
+      - name: Сборка APK (arm64-v8a)
+        env:
+          TAURI_ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/safekey.keystore
+          TAURI_ANDROID_KEYSTORE_PASSWORD: safekey123456
+          TAURI_ANDROID_KEY_ALIAS: safekey
+          TAURI_ANDROID_KEY_PASSWORD: safekey123456
+        run: npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: safekey-android-apk
+          if-no-files-found: warn
+          path: src-tauri/gen/android/app/build/outputs/apk/**/**.apk
+
+# Примечания:
+# - APK самоподписанный: устанавливается вручную («разрешить установку из неизвестных
+#   источников»). Для Google Play нужен аккаунт разработчика ($25) и постоянный ключ —
+#   сохраните keystore в Secrets и уберите шаг keytool.
+# - Ключ генерируется заново на каждой сборке, поэтому Android сочтёт сборки разными
+#   приложениями (переустановка с удалением). Для стабильного ключа — Secrets.
+# - --target aarch64 покрывает практически все современные телефоны (arm64-v8a).
+#   Уберите флаг, чтобы собрать universal-APK (дольше).
