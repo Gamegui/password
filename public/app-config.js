@@ -8,6 +8,9 @@ window.SAFEKEY_CONFIG = {
   // доступ «Яндекс Диск REST API → Доступ к папке приложения»
   YANDEX_CLIENT_ID: '',
   // https://console.cloud.google.com/apis/credentials — OAuth-клиент
-  // «Web application», scope drive.appdata (appDataFolder)
+  // «Web application», scope drive.appdata (appDataFolder).
+  // Client Secret сюда НЕ кладите: он вводится в самом приложении (карточка
+  // Google Drive) и хранится только в localStorage браузера — в открытом
+  // коде репозитория секрета нет.
   GOOGLE_CLIENT_ID: ''
 }

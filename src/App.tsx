@@ -11,7 +11,7 @@ import {
   getSyncState, markSynced, providers, pullRemote, pushVault, type ProviderId, type SyncState
 } from './sync'
 import { getClientId as getYandexClientId, setClientId as setYandexClientId } from './yandex'
-import { getClientId as getGoogleClientId, setClientId as setGoogleClientId } from './gdrive'
+import { getClientId as getGoogleClientId, setClientId as setGoogleClientId, getClientSecret as getGoogleClientSecret, setClientSecret as setGoogleClientSecret } from './gdrive'
 import type { EncryptedVault, VaultData, VaultItem } from './types'
 
 const STORAGE_KEY = 'safekey.encrypted.v1'
@@ -109,7 +109,10 @@ function App() {
       const result = await completeOAuthRedirect()
       if (!result) return
       const cloud = providers[result.provider].title
-      if ('error' in result) { notify(`Вход через ${cloud} не завершён — попробуйте снова`); return }
+      if ('error' in result) {
+        notify(result.error === 'client_secret_missing' ? 'Укажите Client Secret в карточке Google' : `Вход через ${cloud} не завершён — попробуйте снова`)
+        return
+      }
       setBusy(true)
       try {
         const state = await connectAccount(result.provider)
@@ -130,7 +133,7 @@ function App() {
   }, [])
 
   if (!vault) return <AuthScreen mode={mode} setMode={setMode} busy={busy} pendingCloud={pendingCloud} createVault={createVault} onCloudLogin={(provider: ProviderId) => {
-    try { beginLogin(provider, 'connect') } catch { setMode('cloud'); notify('Сначала укажите ClientID приложения') }
+    try { beginLogin(provider, 'connect') } catch { setMode('cloud'); notify('Сначала укажите ClientID и Client Secret приложения') }
   }} onCloudUnlock={async password => {
     if (!pendingCloud) return false
     try {
@@ -238,6 +241,7 @@ function App() {
 function ProviderConnect({ onLogin }: { onLogin: (provider: ProviderId) => void }) {
   const [yandexId, setYandexId] = useState(getYandexClientId())
   const [googleId, setGoogleId] = useState(getGoogleClientId())
+  const [googleSecret, setGoogleSecret] = useState(getGoogleClientSecret())
   return <div className="provider-cards">
     <div className="provider-card">
       <div className="provider-head"><span className="stat-icon green"><Cloud size={17} /></span><div><strong>Яндекс Диск</strong><p>Папка «Приложения/SafeKey» · долгоживущий токен</p></div></div>
@@ -249,11 +253,12 @@ function ProviderConnect({ onLogin }: { onLogin: (provider: ProviderId) => void 
     </div>
     <div className="provider-card">
       <div className="provider-head"><span className="stat-icon blue"><Cloud size={17} /></span><div><strong>Google Drive</strong><p>Скрытая папка приложения (appDataFolder)</p></div></div>
-      {!googleId.trim() && <>
+      {(!googleId.trim() || !googleSecret.trim()) && <>
         <input className="provider-input" value={googleId} onChange={e => setGoogleId(e.target.value)} placeholder="ClientID с Google Cloud Console" />
-        <p className="cloud-hint">OAuth-клиент «Web application» в <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud Console <ExternalLink size={10} style={{ display: 'inline-block' }} /></a>: JS-origins и Redirect URI — адрес этой страницы, scope <code>drive.appdata</code> (подробно — README).</p>
+        <input className="provider-input" type="password" value={googleSecret} onChange={e => setGoogleSecret(e.target.value)} placeholder="Client Secret с Google Cloud Console" />
+        <p className="cloud-hint">OAuth-клиент «Web application» в <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud Console <ExternalLink size={10} style={{ display: 'inline-block' }} /></a>: JS-origins и Redirect URI — адрес этой страницы, scope <code>drive.appdata</code> (подробно — README). Секрет хранится только в этом браузере и не попадает в код приложения.</p>
       </>}
-      <button className="secondary full" disabled={!googleId.trim()} onClick={() => { setGoogleClientId(googleId); onLogin('google') }}>Войти через Google</button>
+      <button className="secondary full" disabled={!googleId.trim() || !googleSecret.trim()} onClick={() => { setGoogleClientId(googleId); setGoogleClientSecret(googleSecret); onLogin('google') }}>Войти через Google</button>
     </div>
   </div>
 }
@@ -428,7 +433,7 @@ function SyncView({ vault, notify, onRemote }: { vault: VaultData; notify: (s: s
 
   const login = (provider: ProviderId) => {
     try { beginLogin(provider, 'sync') }
-    catch { notify('Сначала укажите ClientID приложения') }
+    catch { notify('Сначала укажите ClientID и Client Secret приложения') }
   }
 
   const logout = () => run(async () => {
